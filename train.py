@@ -27,9 +27,10 @@ def get_loss_fn(loss_type):
     elif loss_type == "mse+l1":
         mse = nn.MSELoss()
         l1 = nn.L1Loss()
+        # Weighted combination of MSE and L1
         return lambda output, target: 0.5 * mse(output, target) + 0.5 * l1(output, target)
     else:
-        raise ValueError("Invalid loss type. Choose from 'mse', 'l1', 'mse+l1'.")
+        raise ValueError("Invalid loss type. Choose from 'mse', 'l1', or 'mse+l1'.")
 
 
 def train_model(model, train_loader, val_loader, device, epochs, lr, loss_type, weight_decay):
@@ -48,8 +49,8 @@ def train_model(model, train_loader, val_loader, device, epochs, lr, loss_type, 
         running_loss = 0.0
 
         for inputs, targets, _ in train_loader:
-            inputs = inputs.to(device)    # (B, 3, 32, 32)
-            targets = targets.to(device)  # (B, 3, 32, 32)
+            inputs = inputs.to(device)
+            targets = targets.to(device)
 
             optimizer.zero_grad()
             outputs = model(inputs)
@@ -62,12 +63,13 @@ def train_model(model, train_loader, val_loader, device, epochs, lr, loss_type, 
         epoch_loss = running_loss / len(train_loader.dataset)
         val_loss = validate_model(model, val_loader, device, criterion)
 
-        # Save best checkpoint
+        # Save best checkpoint if this is the best val loss so far
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save(model.state_dict(), best_checkpoint_path)
             wandb.run.summary["best_val_loss"] = best_val_loss
 
+        # Log training metrics
         wandb.log({
             "epoch": epoch,
             "train_loss": epoch_loss,
@@ -80,6 +82,13 @@ def train_model(model, train_loader, val_loader, device, epochs, lr, loss_type, 
         if epoch % 20 == 0:
             visualize_predictions(model, val_loader, device, num_samples=8)
 
+        # Compute & log pure MSE every 100 epochs (for monitoring even if training with L1 or combined)
+        if epoch % 100 == 0:
+            val_mse = compute_val_mse(model, val_loader, device)
+            wandb.log({"val_mse": val_mse})
+            print(f"Epoch [{epoch}/{epochs}], Validation MSE: {val_mse:.4f}")
+
+    # Final logging after training
     wandb.log({"final_val_loss": best_val_loss})
     wandb.save(best_checkpoint_path)
     return best_val_loss, best_checkpoint_path
@@ -87,7 +96,7 @@ def train_model(model, train_loader, val_loader, device, epochs, lr, loss_type, 
 
 def validate_model(model, val_loader, device, criterion):
     """
-    Validates the model on the given data loader.
+    Validates the model on the given data loader using the chosen training criterion.
     """
     model.eval()
     val_loss = 0.0
@@ -102,9 +111,27 @@ def validate_model(model, val_loader, device, criterion):
     return val_loss
 
 
+def compute_val_mse(model, val_loader, device):
+    """
+    Computes pure MSE over the entire validation set, regardless of the training loss type.
+    """
+    model.eval()
+    mse_criterion = nn.MSELoss()
+    val_loss = 0.0
+    with torch.no_grad():
+        for inputs, targets, _ in val_loader:
+            inputs = inputs.to(device)
+            targets = targets.to(device)
+            outputs = model(inputs)
+            loss = mse_criterion(outputs, targets)
+            val_loss += loss.item() * inputs.size(0)
+    val_loss /= len(val_loader.dataset)
+    return val_loss
+
+
 def visualize_predictions(model, loader, device, num_samples=8):
     """
-    Logs a grid of input, target, and predicted images to wandb.
+    Logs three separate panels to wandb: input, target, and prediction.
     """
     import torchvision.utils as vutils
 
@@ -113,6 +140,8 @@ def visualize_predictions(model, loader, device, num_samples=8):
     inputs = inputs.to(device)
     with torch.no_grad():
         preds = model(inputs)
+
+    # Move back to CPU for visualization
     inputs = inputs.cpu()
     preds = preds.cpu()
     targets = targets.cpu()
@@ -126,6 +155,7 @@ def visualize_predictions(model, loader, device, num_samples=8):
         "predictions": [wandb.Image(preds_grid, caption="Model Predictions")],
         "targets": [wandb.Image(targets_grid, caption="Target Images")]
     })
+
 
 def none_or_int(value):
     if value.lower() == "none":
@@ -142,12 +172,8 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate.")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay for AdamW.")
     parser.add_argument("--loss", type=str, default="mse", choices=["mse", "l1", "mse+l1"], help="Loss function to use.")
-    parser.add_argument(
-        "--max_samples",
-        type=none_or_int,
-        default=None,
-        help="Max samples to load for train/val/test. Use 'None' to load the entire dataset."
-    )
+    parser.add_argument("--max_samples", type=none_or_int, default=None,
+                        help="Max samples to load for train/val/test. Use 'None' to load the entire dataset.")
     parser.add_argument("--dataset_dir", type=str, default="/pub0/smnair/stat946/shape-rotator/dataset",
                         help="Path to the dataset folder containing CSVs.")
     parser.add_argument("--num_workers", type=int, default=2, help="Number of dataloader workers.")
@@ -178,7 +204,7 @@ def main():
     # Instantiate the model
     model = UNet(n_channels=3, n_classes=3)
 
-    # Train the model and get best checkpoint path
+    # Train the model
     best_val_loss, best_checkpoint_path = train_model(
         model=model,
         train_loader=train_loader,
@@ -194,8 +220,13 @@ def main():
     print(f"Final Validation Loss: {best_val_loss:.4f}")
     wandb.log({"final_val_loss": best_val_loss})
 
+    # Compute final MSE on the entire validation set
+    final_val_mse = compute_val_mse(model, val_loader, device)
+    print(f"Final Validation MSE: {final_val_mse:.4f}")
+    wandb.log({"final_val_mse": final_val_mse})
+
     # Load the best checkpoint before final visualization
-    print("Loading best checkpoint for visualization...")
+    print("Loading best checkpoint for final visualization...")
     model.load_state_dict(torch.load(best_checkpoint_path, map_location=device))
 
     # Final visualization using the best checkpoint
